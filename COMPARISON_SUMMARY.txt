@@ -1,0 +1,39 @@
+Subject: Similar-Sets Project Update - Old vs New Version Comparison
+
+---
+
+SUMMARY OF CHANGES
+
+The new version adds a modern block-based skiplist data structure as an alternative to the original array-based connector.
+
+NEW FILES ADDED:
+• cskiplist.h / cskiplist.c - Cache-friendly skiplist implementation
+• connector_csl.c - Adapter connecting the new skiplist to existing API
+• test-cskiplist.c / test-cskiplist-enhanced.c - Test suites
+• SKIPLIST_IMPROVEMENTS.md - Documentation
+
+KEY IMPROVEMENTS:
+• Better memory efficiency with block-based storage
+• Backward iteration support via reverse pointers
+• Automatic block splitting and statistics tracking
+• Safe operations even without full rebuilds
+• Comprehensive test coverage
+
+ORIGINAL FILES:
+• Remain unchanged (set.c, set2.c, config.c, etc.)
+• Full backward compatibility maintained
+
+---
+
+FUTURE ENHANCEMENTS
+
+Possible improvements for next iterations:
+
+• Incremental rebuild - Update skip pointers partially instead of full rebuild
+• Key compression - Use delta encoding within blocks to reduce memory
+• Parallel operations - Add thread-safe locking for concurrent access
+• Persistence - Save/load skiplist to disk
+• Performance tuning - Optimize block size and skip patterns
+• Memory pooling - Reduce allocation overhead for large datasets
+
+---

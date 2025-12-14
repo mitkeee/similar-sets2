@@ -1,0 +1,49 @@
+Running program set2
+--------------------
+
+set2 is a program that
+1) reads a dataset and creates a set-trie index in main memory,
+2) reads sets (queries) from a testset one by one,
+3) checks each test set against the set-trie index and
+4) prints the sets from set-trie index that match the query.
+
+Syntax:
+[src/C]$ ./set2 distance dataset < testset > results
+
+distance - Hamming distance
+dataset - dataset.mapd.sorted
+testset - dataset.mapd.test.sorted
+results - queries start with "?", similar sets from set-trie follow,
+          and the query ends with running time in nanoseconds.
+          See below for an example.
+
+
+Sample session
+--------------
+
+[src/C]$ make
+gcc -g   -c -o config.o config.c
+gcc -g   -c -o set.o set.c
+gcc -g   -c -o qesa.o qesa.c
+gcc -g   -c -o connector.o connector.c
+gcc -g   -c -o set2.o set2.c
+gcc -g   -c -o test-set2.o test-set2.c
+gcc -g    -o set2 config.o set.o qesa.o connector.o set2.o test-set2.o 
+[src/C]$ 
+[src/C]$ ./set2 2 sample.txt.mapd.sorted < sample.txt.mapd.test.sorted 
+# hamming=2
+? 0 1 2 4 5 16
+0 1 2 3 4 5
+0 1 2 4
+0 1 2 4 5
+0 1 2 4 5 16
+= 6173
+? 0 3 7
+0 2 3
+0 3 4
+0 3 7
+= 5199
+? 1 7 8 9 10
+1 7 8 9 10
+= 3805
+[src/C]$ 
