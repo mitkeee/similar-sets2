@@ -6,10 +6,11 @@ OBJECTS2 = config.o set.o qesa.o connector.o set2.o set2hat.o test-hat.o
 SKIPLIST_OBJS = skiplist.o test-skiplist.o
 CSKIPLIST_OBJS = cskiplist.o test-cskiplist.o
 CSKIPLIST_ENH_OBJS = cskiplist.o test-cskiplist-enhanced.o
+CSKIPLIST_MILLION_OBJS = cskiplist.o test-cskiplist-million.o
 SLIBS = 
 PROGRAM = set2
 
-all : set2 hat skiptest cskiptest cskiptest-enh
+all : set2 hat skiptest cskiptest cskiptest-enh cskiptest-million
 
 set2 : 	$(OBJECTS1) 
 	$(LINK.c) -o $@ $(OBJECTS1) $(SLIBS)
@@ -25,6 +26,9 @@ cskiptest : $(CSKIPLIST_OBJS)
 
 cskiptest-enh : $(CSKIPLIST_ENH_OBJS)
 	$(LINK.c) -o $@ $(CSKIPLIST_ENH_OBJS) $(SLIBS)
+
+cskiptest-million : $(CSKIPLIST_MILLION_OBJS)
+	$(LINK.c) -o $@ $(CSKIPLIST_MILLION_OBJS) $(SLIBS)
 
 config.o:	config.c
 
@@ -45,4 +49,5 @@ test-skiplist.o: test-skiplist.c skiplist.h
 cskiplist.o: cskiplist.c cskiplist.h
 test-cskiplist.o: test-cskiplist.c cskiplist.h
 test-cskiplist-enhanced.o: test-cskiplist-enhanced.c cskiplist.h
+test-cskiplist-million.o: test-cskiplist-million.c cskiplist.h
 
