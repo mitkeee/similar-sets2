@@ -3,20 +3,52 @@
 #include <string.h>
 #include <limits.h>
 
+/* Size of a csl_block with `n` skip-pointer slots */
+#define BLK_SIZE(n) (sizeof(csl_block) + (size_t)(n) * sizeof(csl_block*))
+
+/* Allocate a data block with just 1 skip-pointer slot (level-0 link).  */
 static csl_block* blk_alloc(void) {
-    csl_block* b = (csl_block*)calloc(1, sizeof(csl_block));
+    csl_block* b = (csl_block*)calloc(1, BLK_SIZE(1));
     if (!b) return NULL;
     b->min_key = INT_MIN;
     b->count = 0;
+    b->skip_alloc = 1;
     b->prev = NULL;
-    memset(b->next, 0, sizeof(b->next));
+    b->next[0] = NULL;
     return b;
+}
+
+/* Allocate the head/sentinel block with full skip-pointer array. */
+static csl_block* blk_alloc_head(void) {
+    csl_block* b = (csl_block*)calloc(1, BLK_SIZE(CSL_MAX_LEVEL));
+    if (!b) return NULL;
+    b->min_key = INT_MIN;
+    b->count = 0;
+    b->skip_alloc = CSL_MAX_LEVEL;
+    b->prev = NULL;
+    return b;
+}
+
+/*
+ * Ensure block has at least `needed` skip-pointer slots.
+ * May realloc and move the block; returns new pointer (or NULL on OOM).
+ * Caller must update any external pointers to the old block address.
+ */
+static csl_block* blk_ensure_skips(csl_block* b, int needed) {
+    if (b->skip_alloc >= needed) return b;
+    csl_block* nb = (csl_block*)realloc(b, BLK_SIZE(needed));
+    if (!nb) return NULL;
+    /* zero out newly available slots */
+    memset(&nb->next[nb->skip_alloc], 0,
+           (size_t)(needed - nb->skip_alloc) * sizeof(csl_block*));
+    nb->skip_alloc = needed;
+    return nb;
 }
 
 cskiplist* csl_create(void) {
     cskiplist* sl = (cskiplist*)calloc(1, sizeof(cskiplist));
     if (!sl) return NULL;
-    sl->head = blk_alloc();
+    sl->head = blk_alloc_head();
     if (!sl->head) { free(sl); return NULL; }
     sl->level = 0;
     sl->nblocks = 0;
@@ -46,7 +78,9 @@ void csl_free(cskiplist* sl, void (*free_val)(csl_val_t)) {
 static csl_block* locate_block(cskiplist* sl, csl_key_t key) {
     csl_block* x = sl->head;
     for (int lvl = sl->level; lvl >= 0; --lvl) {
-        while (x->next[lvl] && x->next[lvl]->min_key <= key) x = x->next[lvl];
+        while (lvl < x->skip_alloc && x->next[lvl] &&
+               x->next[lvl]->min_key <= key)
+            x = x->next[lvl];
     }
     return x; /* x is the block whose min_key <= key, or head if before first */
 }
@@ -296,7 +330,7 @@ void csl_rebuild_skips(cskiplist* sl) {
     if (!sl) return;
     /* collect blocks into array */
     size_t cap = sl->nblocks + 1;
-    csl_block** arr = (csl_block**)malloc(sizeof(csl_block*) * (cap));
+    csl_block** arr = (csl_block**)malloc(sizeof(csl_block*) * cap);
     if (!arr) return;
     size_t m = 0;
     csl_block* cur = sl->head->next[0];
@@ -307,18 +341,45 @@ void csl_rebuild_skips(cskiplist* sl) {
     while ((size_t)(1ull << (top+1)) <= m) ++top;
     sl->level = top;
 
-    /* clear all pointers above level 0 */
-    for (size_t i = 0; i < m; ++i) memset(arr[i]->next + 1, 0, (CSL_MAX_LEVEL-1) * sizeof(csl_block*));
+    /*
+     * Grow blocks that need higher skip levels.  A block at index i
+     * participates in level k iff (i+1) is divisible by 2^k.  Its
+     * required height = number-of-trailing-zeros(i+1) + 1, capped at
+     * top+1.  After realloc we rebuild the entire level-0 chain and
+     * prev pointers from arr[] so moved-block addresses are handled.
+     */
+    for (size_t i = 0; i < m; ++i) {
+        int height = 1;
+        { size_t v = i + 1; while ((v & 1) == 0 && height <= top) { v >>= 1; ++height; } }
+        if (height > top + 1) height = top + 1;
+        if (arr[i]->skip_alloc < height) {
+            csl_block* nb = blk_ensure_skips(arr[i], height);
+            if (nb) arr[i] = nb; /* may have moved */
+        }
+    }
 
-    /* link level 0 chain already exists; rebuild higher levels deterministically */
+    /* Rebuild level-0 chain and prev pointers from the (possibly moved) arr[] */
+    sl->head->next[0] = (m > 0) ? arr[0] : NULL;
+    for (size_t i = 0; i < m; ++i) {
+        arr[i]->next[0] = (i + 1 < m) ? arr[i + 1] : NULL;
+        arr[i]->prev = (i > 0) ? arr[i - 1] : NULL;
+    }
+
+    /* clear skip pointers above level 0 */
+    for (size_t i = 0; i < m; ++i) {
+        for (int lvl = 1; lvl < arr[i]->skip_alloc; ++lvl)
+            arr[i]->next[lvl] = NULL;
+    }
+
+    /* rebuild higher levels deterministically */
     for (int lvl = 1; lvl <= top; ++lvl) {
         size_t stride = 1ull << lvl;
-        csl_block* prev = sl->head;
+        csl_block* prev_blk = sl->head;
         for (size_t i = stride - 1; i < m; i += stride) {
-            prev->next[lvl] = arr[i];
-            prev = arr[i];
+            prev_blk->next[lvl] = arr[i];
+            prev_blk = arr[i];
         }
-        prev->next[lvl] = NULL;
+        prev_blk->next[lvl] = NULL;
     }
 
     free(arr);

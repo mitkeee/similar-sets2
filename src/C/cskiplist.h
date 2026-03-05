@@ -28,13 +28,21 @@ typedef struct csl_kv {
     csl_val_t val;
 } csl_kv;
 
-/* Memory block of sorted key/value pairs + skip pointers */
+/*
+ * Memory block of sorted key/value pairs + skip pointers.
+ * Skip pointers (next[]) are a flexible array member at the END so that
+ * small blocks can be allocated with just 1 slot (level-0 link) and later
+ * extended via realloc when higher skip levels are needed.  This saves
+ * (CSL_MAX_LEVEL-1)*sizeof(ptr) per block that never participates in
+ * higher skip levels.
+ */
 typedef struct csl_block {
     int min_key;                     /* minimum key in items[] */
     int count;                       /* number of valid items */
-    csl_kv items[CSL_BLOCK_CAP];     /* sorted by key */
+    int skip_alloc;                  /* number of slots allocated in next[] */
     struct csl_block* prev;          /* backward pointer on level 0 chain */
-    struct csl_block* next[CSL_MAX_LEVEL]; /* skip pointers across blocks */
+    csl_kv items[CSL_BLOCK_CAP];     /* sorted by key */
+    struct csl_block* next[];        /* FAM: [0]=level-0 link, [1..]=skips */
 } csl_block;
 
 /* Skip list of blocks */
