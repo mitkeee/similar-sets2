@@ -17,7 +17,7 @@ TEST_PROC_BASE_OBJS = config.o set.o qesa.o connector.o set2.o test-procedure.o
 SLIBS = 
 PROGRAM = set2
 
-all : set2 hat skiptest cskiptest cskiptest-enh cskiptest-million skipbench askiptest cachebench simdbench eyttest testproc
+all : set2 hat skiptest cskiptest cskiptest-enh cskiptest-million skipbench askiptest cachebench simdbench eyttest branchless testproc
 
 set2 : 	$(OBJECTS1) 
 	$(LINK.c) -o $@ $(OBJECTS1) $(SLIBS)
@@ -52,6 +52,9 @@ simdbench : $(SIMD_BENCH_OBJS)
 eyttest : $(EYT_TEST_OBJS)
 	$(LINK.c) -o $@ $(EYT_TEST_OBJS) $(SLIBS) -lpsapi
 
+branchless : test-branchless.o
+	$(LINK.c) -o $@ test-branchless.o $(SLIBS) -lpsapi
+
 testproc : $(TEST_PROC_OBJS)
 	$(LINK.c) -o $@ $(TEST_PROC_OBJS) $(SLIBS) -lpsapi
 
@@ -84,6 +87,7 @@ test-askiplist.o: test-askiplist.c askiplist.h
 test-cache-benchmark.o: test-cache-benchmark.c cskiplist.h
 test-simd-benchmark.o: test-simd-benchmark.c cskiplist.h
 test-eytzinger.o: test-eytzinger.c cskiplist.h
+test-branchless.o: test-branchless.c
 connector_csl.o: connector_csl.c connector.h cskiplist.h
 test-procedure.o: test-procedure.c config.h set.h qesa.h connector.h set2.h cskiplist.h
 

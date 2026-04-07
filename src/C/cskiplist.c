@@ -202,33 +202,38 @@ static int blk_binary_search(csl_block* b, csl_key_t key) {
 #endif /* CSL_USE_SIMD */
 
     /*-----------------------------------------------------------------
-     * Scalar binary search for larger blocks.
+     * Branchless binary search (lower-bound) for larger sorted blocks.
      *
-     * GCC hint: __builtin_expect tells the branch predictor that the
-     * loop usually continues (lo <= hi).  This helps the CPU pipeline
-     * avoid flushes on the loop continuation branch.
+     * Uses conditional arithmetic that the compiler converts to CMOV
+     * instructions, eliminating branch misprediction penalties entirely.
+     * The loop body has NO branches — the pointer advance is computed
+     * via a comparison result (0 or 1) multiplied by the half-step.
      *
-     * The search itself is the classic K&R binary search on the sorted
-     * items[] array.  Returns index >= 0 on match, or -(insertion_point+1).
+     * Algorithm: narrow the search range by halving, always advancing
+     * the base pointer by `half` when items[base+half] < key.
+     * After the loop, base points at the lower-bound candidate.
+     *
+     * Reference: Khuong & Morin, "Array Layouts for Comparison-Based
+     * Searching" (2015), §3.1 — "branchless binary search".
      *-----------------------------------------------------------------*/
-    int lo = 0, hi = b->count - 1;
-    while (__builtin_expect(lo <= hi, 1)) {
-        /* Avoid overflow: (lo + hi) / 2 can overflow for large values.
-         * lo + ((hi - lo) >> 1) is safe and branch-free. */
-        int mid = lo + ((hi - lo) >> 1);
-
-        /* Use cmov-friendly comparison style.
-         * GCC -O3 with -march=native may convert this to branchless code.
-         * The ternary form encourages CMOV generation vs branchy if/else. */
-        csl_key_t mid_key = b->items[mid].key;
-        if (mid_key < key)
-            lo = mid + 1;
-        else if (mid_key > key)
-            hi = mid - 1;
-        else
-            return mid;  /* exact match */
+    {
+        const csl_kv* base = b->items;
+        int n = b->count;
+        while (n > 1) {
+            int half = n >> 1;
+            /* Branchless: compiler generates cmov for this ternary.
+             * base advances by `half` iff base[half].key < key. */
+            base = (base[half].key < key) ? base + half : base;
+            n -= half;
+        }
+        /* base[0] is the lower-bound candidate.
+         * If base[0] < key, the true lower bound is one position right. */
+        int lo = (int)(base - b->items);
+        if (lo < b->count && base->key < key) lo++;
+        if (lo < b->count && b->items[lo].key == key)
+            return lo;            /* exact match */
+        return -(lo + 1);        /* insertion point */
     }
-    return -(lo + 1); /* insertion point */
 }
 
 /*-----------------------------------------------------------------------------
