@@ -56,6 +56,7 @@ typedef struct cskiplist {
     size_t stat_updates;
     size_t stat_deletes;
     size_t stat_splits;
+    int eytzinger;     /* 0=sorted layout, 1=Eytzinger BFS layout within blocks */
 } cskiplist;
 
 /* API */
@@ -77,10 +78,16 @@ csl_val_t csl_search(cskiplist* sl, csl_key_t key);
 /* Rebuild skip pointers deterministically using power-of-two strides */
 void csl_rebuild_skips(cskiplist* sl);
 
+/* Enable/disable Eytzinger (BFS) layout within blocks.
+ * When enabled, items[] are rearranged for branchless, cache-friendly search.
+ * Enable AFTER bulk construction for best results; inserts/deletes auto-convert. */
+void csl_set_eytzinger(cskiplist* sl, int enable);
+
 /* Lightweight iterator over key/value pairs (in-order) */
 typedef struct csl_iter {
     csl_block* b; /* current block, NULL if invalid */
     int idx;      /* index within block */
+    int eytzinger; /* 0=sorted, 1=Eytzinger layout (set by iter_first/iter_seek) */
 } csl_iter;
 
 /* Initialize iterator to first item; returns 1 if non-empty, else 0 */
