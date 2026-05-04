@@ -35,6 +35,20 @@ static double timer_us(void) {
 #endif
 
 /* ====================================================================
+ * Tunable parameters — change these to adjust benchmark sizes/counts
+ * ==================================================================== */
+/* Array sizes tested in each category */
+#define SMALL_SIZES   {2, 3, 5, 7, 10, 15, 20, 30, 50}
+#define MED_SIZES     {64, 100, 128, 200, 256}
+#define LARGE_SIZES   {512, 1000, 2000, 5000}
+
+/* Number of search queries per benchmark run (more = more stable timing) */
+#define SMALL_QUERIES  2000000
+#define MED_QUERIES    1000000
+#define LARGE_QUERIES   500000
+/* ==================================================================== */
+
+/* ====================================================================
  * Search implementations (self-contained for benchmark isolation)
  * ==================================================================== */
 
@@ -259,9 +273,9 @@ int main(void) {
     printf("\n=== Small arrays (2-50 elements) ===\n");
     printf("  (These dominate set-trie search: millions of tiny nodes)\n\n");
 
-    int small_sizes[] = {2, 3, 5, 7, 10, 15, 20, 30, 50};
+    int small_sizes[] = SMALL_SIZES;
     int nsmall = (int)(sizeof(small_sizes) / sizeof(small_sizes[0]));
-    int small_q = 2000000;
+    int small_q = SMALL_QUERIES;
 
     for (int i = 0; i < nsmall; i++) {
         benchmark_size(small_sizes[i], small_q, "(small)");
@@ -270,9 +284,9 @@ int main(void) {
     /* --- Medium arrays (typical block sizes) --- */
     printf("\n=== Medium arrays (64-256 elements, typical block sizes) ===\n\n");
 
-    int med_sizes[] = {64, 100, 128, 200, 256};
+    int med_sizes[] = MED_SIZES;
     int nmed = (int)(sizeof(med_sizes) / sizeof(med_sizes[0]));
-    int med_q = 1000000;
+    int med_q = MED_QUERIES;
 
     for (int i = 0; i < nmed; i++) {
         benchmark_size(med_sizes[i], med_q, "(medium)");
@@ -281,9 +295,9 @@ int main(void) {
     /* --- Large arrays (stress test) --- */
     printf("\n=== Large arrays (512-5000 elements) ===\n\n");
 
-    int large_sizes[] = {512, 1000, 2000, 5000};
+    int large_sizes[] = LARGE_SIZES;
     int nlarge = (int)(sizeof(large_sizes) / sizeof(large_sizes[0]));
-    int large_q = 500000;
+    int large_q = LARGE_QUERIES;
 
     for (int i = 0; i < nlarge; i++) {
         benchmark_size(large_sizes[i], large_q, "(large)");

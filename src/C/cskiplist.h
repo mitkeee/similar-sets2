@@ -13,7 +13,7 @@ extern "C" {
 #endif
 
 #ifndef CSL_BLOCK_CAP
-#define CSL_BLOCK_CAP 128  /* items per block; tune for cache line / page */
+#define CSL_BLOCK_CAP 128  /* default items per block for csl_create() */
 #endif
 
 #ifndef CSL_MAX_LEVEL
@@ -29,26 +29,25 @@ typedef struct csl_kv {
 } csl_kv;
 
 /*
- * Memory block of sorted key/value pairs + skip pointers.
- * Skip pointers (next[]) are a flexible array member at the END so that
- * small blocks can be allocated with just 1 slot (level-0 link) and later
- * extended via realloc when higher skip levels are needed.  This saves
- * (CSL_MAX_LEVEL-1)*sizeof(ptr) per block that never participates in
- * higher skip levels.
+ * Memory block of sorted key/value pairs plus separately allocated skip slots.
+ * `item_cap` is now runtime-sized per skiplist instance, which allows
+ * per-instance block sizing and per-level sizing policies.
  */
 typedef struct csl_block {
-    int min_key;                     /* minimum key in items[] */
-    int count;                       /* number of valid items */
-    int skip_alloc;                  /* number of slots allocated in next[] */
-    struct csl_block* prev;          /* backward pointer on level 0 chain */
-    csl_kv items[CSL_BLOCK_CAP];     /* sorted by key */
-    struct csl_block* next[];        /* FAM: [0]=level-0 link, [1..]=skips */
+    int min_key;              /* minimum key in items[] */
+    int count;                /* number of valid items */
+    int item_cap;             /* allocated capacity of items[] */
+    int skip_alloc;           /* number of slots allocated in next[] */
+    struct csl_block* prev;   /* backward pointer on level 0 chain */
+    csl_kv* items;            /* sorted or Eytzinger-laid-out key/value array */
+    struct csl_block** next;  /* [0]=level-0 link, [1..]=skips */
 } csl_block;
 
 /* Skip list of blocks */
 typedef struct cskiplist {
     csl_block* head;   /* sentinel block; min_key = INT32_MIN, count=0 */
     int level;         /* top level currently valid (0-based) */
+    int block_cap;     /* per-instance block capacity */
     size_t nblocks;    /* number of data blocks (excludes head) */
     size_t size;       /* number of items across all blocks */
     /* simple stats */
@@ -61,6 +60,11 @@ typedef struct cskiplist {
 
 /* API */
 cskiplist* csl_create(void);
+cskiplist* csl_create_with_block_cap(int block_cap);
+cskiplist* csl_create_for_level(int trie_level);
+int csl_choose_block_cap_for_level(int trie_level);
+int csl_tlb_aware_block_cap_hint(int requested_block_cap);
+int csl_get_block_cap(const cskiplist* sl);
 void csl_free(cskiplist* sl, void (*free_val)(csl_val_t));
 
 /* Append item assuming non-decreasing keys. Returns 1 on append, 0 on update (same key at tail), -1 on OOM */

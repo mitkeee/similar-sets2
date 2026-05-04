@@ -186,6 +186,48 @@ void test_random_operations() {
     csl_free(sl, NULL);
 }
 
+void test_runtime_block_cap() {
+    printf("\n=== Test Runtime Block Capacity ===\n");
+    cskiplist* sl = csl_create_with_block_cap(16);
+
+    printf("Configured block cap: %d\n", csl_get_block_cap(sl));
+    for (int i = 0; i < 200; i++) {
+        csl_insert(sl, i, (void*)(intptr_t)(i + 1));
+    }
+    printf("Inserted: 200 keys, blocks: %zu\n", sl->nblocks);
+    printf("First block capacity: %d\n", sl->head->next[0] ? sl->head->next[0]->item_cap : 0);
+
+    if (csl_get_block_cap(sl) == 16 && sl->head->next[0] && sl->head->next[0]->item_cap == 16) {
+        printf("✓ Runtime block capacity passed\n");
+    } else {
+        printf("✗ Runtime block capacity failed\n");
+    }
+
+    csl_free(sl, NULL);
+}
+
+void test_level_adaptive_block_cap() {
+    printf("\n=== Test Level-Adaptive Block Capacity ===\n");
+    cskiplist* shallow = csl_create_for_level(0);
+    cskiplist* deep = csl_create_for_level(12);
+
+    printf("Level 0 cap: %d\n", csl_get_block_cap(shallow));
+    printf("Level 12 cap: %d\n", csl_get_block_cap(deep));
+
+    for (int i = 0; i < 80; i++) {
+        csl_insert(deep, i, (void*)(intptr_t)i);
+    }
+
+    if (csl_get_block_cap(shallow) > csl_get_block_cap(deep) && deep->size == 80) {
+        printf("✓ Level-adaptive block capacity passed\n");
+    } else {
+        printf("✗ Level-adaptive block capacity failed\n");
+    }
+
+    csl_free(shallow, NULL);
+    csl_free(deep, NULL);
+}
+
 int main(void) {
     printf("╔═══════════════════════════════════════════════════════╗\n");
     printf("║  Enhanced CSkiplist Test Suite                       ║\n");
@@ -196,6 +238,8 @@ int main(void) {
     test_split_behavior();
     test_stats();
     test_random_operations();
+    test_runtime_block_cap();
+    test_level_adaptive_block_cap();
     
     printf("\n╔═══════════════════════════════════════════════════════╗\n");
     printf("║  All tests completed successfully!                   ║\n");

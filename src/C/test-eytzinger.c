@@ -35,6 +35,26 @@ static double timer_us(void) {
 }
 #endif
 
+/* ====================================================================
+ * Tunable parameters — change these to adjust test and benchmark sizes
+ * ==================================================================== */
+#define TEST1_N               500   /* test_conversion_and_search: skiplist size */
+#define TEST2_N               300   /* test_eytzinger_iteration:   skiplist size */
+#define TEST3_N               200   /* test_eytzinger_seek:        skiplist size */
+#define TEST4_N               100   /* test_eytzinger_insert_delete: skiplist size */
+
+#define BENCH_N            100000   /* benchmark: number of items in skiplist */
+#define BENCH_QUERIES      500000   /* benchmark: number of search queries */
+#define BENCH_ITER_ROUNDS      20   /* benchmark_iteration: rounds to average over */
+
+#define SWEEP_QUERIES_PER_SIZE 100000  /* cache_latency_sweep: queries per data size */
+#define COLD_CACHE_N        200000     /* cold_cache_measurement: skiplist size */
+#define COLD_CACHE_TRIALS      500     /* cold_cache_measurement: number of trials */
+#define MISS_PENALTY_NS       100.0    /* assumed DRAM miss penalty (nanoseconds) */
+
+#define EVICT_SIZE (16 * 1024 * 1024)  /* cache-eviction buffer; must exceed L3 size */
+/* ==================================================================== */
+
 #define PASS printf("  PASS\n")
 #define FAIL(msg) do { printf("  FAIL: %s\n", msg); failures++; } while(0)
 
@@ -46,18 +66,29 @@ static cskiplist* build_skiplist(int n) {
     cskiplist* sl = csl_create();
     if (!sl) return NULL;
 
-    int cap = CSL_BLOCK_CAP;
+    int cap = csl_get_block_cap(sl);
     int nblocks = (n + cap - 1) / cap;
     csl_block** blocks = (csl_block**)malloc(sizeof(csl_block*) * nblocks);
 
     /* create blocks and fill with sequential keys */
     for (int bi = 0; bi < nblocks; bi++) {
-        /* use csl_append-style allocation: allocate block with 1 skip slot */
-        csl_block* b = (csl_block*)calloc(1, sizeof(csl_block) + sizeof(csl_block*));
-        b->skip_alloc = 1;
         int start = bi * cap;
         int end = start + cap;
+        csl_block* b = (csl_block*)calloc(1, sizeof(csl_block));
         if (end > n) end = n;
+        if (!b) { free(blocks); csl_free(sl, NULL); return NULL; }
+        b->item_cap = cap;
+        b->skip_alloc = 1;
+        b->items = (csl_kv*)calloc((size_t)cap, sizeof(csl_kv));
+        b->next = (csl_block**)calloc(1, sizeof(csl_block*));
+        if (!b->items || !b->next) {
+            free(b->items);
+            free(b->next);
+            free(b);
+            free(blocks);
+            csl_free(sl, NULL);
+            return NULL;
+        }
         b->count = end - start;
         b->min_key = start * 2;  /* keys: 0, 2, 4, ... */
         for (int j = 0; j < b->count; j++) {
@@ -85,7 +116,7 @@ static cskiplist* build_skiplist(int n) {
 /* ---- Test 1: Eytzinger conversion + search correctness ---- */
 static void test_conversion_and_search(void) {
     printf("Test 1: Eytzinger conversion and search\n");
-    int N = 500;
+    int N = TEST1_N;
     cskiplist* sl = build_skiplist(N);
     if (!sl) { FAIL("build_skiplist"); return; }
 
@@ -131,7 +162,7 @@ static void test_conversion_and_search(void) {
 /* ---- Test 2: Iterator in Eytzinger mode ---- */
 static void test_eytzinger_iteration(void) {
     printf("Test 2: Eytzinger iteration (forward + reverse)\n");
-    int N = 300;
+    int N = TEST2_N;
     cskiplist* sl = build_skiplist(N);
     if (!sl) { FAIL("build"); return; }
 
@@ -187,7 +218,7 @@ static void test_eytzinger_iteration(void) {
 /* ---- Test 3: Seek in Eytzinger mode ---- */
 static void test_eytzinger_seek(void) {
     printf("Test 3: Eytzinger seek (exact + lower bound)\n");
-    int N = 200;
+    int N = TEST3_N;
     cskiplist* sl = build_skiplist(N);
     if (!sl) { FAIL("build"); return; }
 
@@ -223,7 +254,7 @@ static void test_eytzinger_seek(void) {
 /* ---- Test 4: Insert and delete after Eytzinger enable ---- */
 static void test_eytzinger_insert_delete(void) {
     printf("Test 4: Insert/delete with Eytzinger active\n");
-    int N = 100;
+    int N = TEST4_N;
     cskiplist* sl = build_skiplist(N);
     if (!sl) { FAIL("build"); return; }
 
@@ -387,7 +418,7 @@ static void benchmark_iteration(int N) {
 
     csl_iter it;
     volatile int sum;
-    int rounds = 20;
+    int rounds = BENCH_ITER_ROUNDS;
     double t0, t1;
 
     /* sorted iteration */
@@ -547,7 +578,7 @@ static void cache_line_analysis(void) {
  * Evict data from CPU caches by reading a large buffer.
  * Size should exceed L3 cache (typically 6-16 MB).
  */
-#define EVICT_SIZE (16 * 1024 * 1024)  /* 16 MB */
+/* EVICT_SIZE is defined in the tunable parameters block at the top */
 static volatile int evict_sink;
 
 static void cache_evict(void) {
@@ -598,7 +629,7 @@ static void cache_latency_sweep(void) {
         2000000,  /* ~16 MB - RAM */
     };
     int nsizes = (int)(sizeof(sizes) / sizeof(sizes[0]));
-    int queries_per_size = 100000;
+    int queries_per_size = SWEEP_QUERIES_PER_SIZE;
 
     for (int si = 0; si < nsizes; si++) {
         int N = sizes[si];
@@ -657,8 +688,8 @@ static void cold_cache_measurement(void) {
     printf("  Each search is preceded by a full cache eviction.\n");
     printf("  This measures worst-case latency (all cache lines are misses).\n\n");
 
-    int N = 200000;  /* ~1.6 MB, exceeds L1+L2 */
-    int trials = 500;
+    int N = COLD_CACHE_N;  /* ~1.6 MB, exceeds L1+L2 */
+    int trials = COLD_CACHE_TRIALS;
 
     cskiplist* sl_sorted = build_skiplist(N);
     cskiplist* sl_eyt = build_skiplist(N);
@@ -698,7 +729,7 @@ static void cold_cache_measurement(void) {
     /* Estimate cache misses:
      * Assume ~100 ns per L3/RAM miss on modern hardware.
      * Estimated misses ≈ total_latency / miss_penalty  (rough) */
-    double miss_penalty_ns = 100.0;  /* ~100 ns typical DRAM latency */
+    double miss_penalty_ns = MISS_PENALTY_NS;  /* ~100 ns typical DRAM latency */
     double sorted_est_misses = sorted_avg_ns / miss_penalty_ns;
     double eyt_est_misses    = eyt_avg_ns / miss_penalty_ns;
     printf("\n  Estimated cache misses per search (assuming %.0f ns/miss):\n", miss_penalty_ns);
@@ -732,8 +763,8 @@ int main(int argc, char* argv[]) {
     printf("\nAll correctness tests passed.\n");
 
     /* Benchmarks */
-    int N = 100000;
-    int Q = 500000;
+    int N = BENCH_N;
+    int Q = BENCH_QUERIES;
     if (argc >= 2) N = atoi(argv[1]);
     if (argc >= 3) Q = atoi(argv[2]);
 

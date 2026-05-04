@@ -41,51 +41,92 @@
   #define CSL_SIMD_SCAN_THRESHOLD 32
 #endif
 
-/* Size of a csl_block with `n` skip-pointer slots */
-#define BLK_SIZE(n) (sizeof(csl_block) + (size_t)(n) * sizeof(csl_block*))
+/* Items per cache line for Eytzinger prefetch distance (64-byte cache line). */
+#define EYT_ITEMS_PER_CL (64 / (int)sizeof(csl_kv))
 
-/* Allocate a data block with just 1 skip-pointer slot (level-0 link).  */
-static csl_block* blk_alloc(void) {
-    csl_block* b = (csl_block*)calloc(1, BLK_SIZE(1));
+/* Heuristic limits used by the TLB-aware block-cap helpers. */
+#define CSL_MIN_BLOCK_CAP 4
+#define CSL_TLB_AWARE_MAX_BLOCK_BYTES (16 * 1024)
+
+/* Allocate a block with runtime-sized item and skip arrays. */
+static csl_block* blk_alloc_with_cap(int item_cap, int skip_slots) {
+    csl_block* b = (csl_block*)calloc(1, sizeof(csl_block));
     if (!b) return NULL;
+
+    b->items = (item_cap > 0)
+        ? (csl_kv*)calloc((size_t)item_cap, sizeof(csl_kv))
+        : NULL;
+    b->next = (csl_block**)calloc((size_t)skip_slots, sizeof(csl_block*));
+
+    if ((item_cap > 0 && !b->items) || !b->next) {
+        free(b->items);
+        free(b->next);
+        free(b);
+        return NULL;
+    }
+
     b->min_key = INT_MIN;
     b->count = 0;
-    b->skip_alloc = 1;
+    b->item_cap = item_cap;
+    b->skip_alloc = skip_slots;
     b->prev = NULL;
-    b->next[0] = NULL;
     return b;
+}
+
+/* Allocate a data block with just 1 skip-pointer slot (level-0 link). */
+static csl_block* blk_alloc(const cskiplist* sl) {
+    return blk_alloc_with_cap(sl ? sl->block_cap : CSL_BLOCK_CAP, 1);
 }
 
 /* Allocate the head/sentinel block with full skip-pointer array. */
 static csl_block* blk_alloc_head(void) {
-    csl_block* b = (csl_block*)calloc(1, BLK_SIZE(CSL_MAX_LEVEL));
-    if (!b) return NULL;
-    b->min_key = INT_MIN;
-    b->count = 0;
-    b->skip_alloc = CSL_MAX_LEVEL;
-    b->prev = NULL;
+    return blk_alloc_with_cap(0, CSL_MAX_LEVEL);
+}
+
+/* Ensure block has at least `needed` skip-pointer slots. */
+static csl_block* blk_ensure_skips(csl_block* b, int needed) {
+    csl_block** new_next;
+
+    if (b->skip_alloc >= needed) return b;
+    new_next = (csl_block**)realloc(b->next, (size_t)needed * sizeof(csl_block*));
+    if (!new_next) return NULL;
+
+    memset(&new_next[b->skip_alloc], 0,
+           (size_t)(needed - b->skip_alloc) * sizeof(csl_block*));
+    b->next = new_next;
+    b->skip_alloc = needed;
     return b;
 }
 
-/*
- * Ensure block has at least `needed` skip-pointer slots.
- * May realloc and move the block; returns new pointer (or NULL on OOM).
- * Caller must update any external pointers to the old block address.
- */
-static csl_block* blk_ensure_skips(csl_block* b, int needed) {
-    if (b->skip_alloc >= needed) return b;
-    csl_block* nb = (csl_block*)realloc(b, BLK_SIZE(needed));
-    if (!nb) return NULL;
-    /* zero out newly available slots */
-    memset(&nb->next[nb->skip_alloc], 0,
-           (size_t)(needed - nb->skip_alloc) * sizeof(csl_block*));
-    nb->skip_alloc = needed;
-    return nb;
+int csl_tlb_aware_block_cap_hint(int requested_block_cap) {
+    int max_by_bytes = CSL_TLB_AWARE_MAX_BLOCK_BYTES / (int)sizeof(csl_kv);
+    int capped = requested_block_cap;
+
+    if (capped < CSL_MIN_BLOCK_CAP) capped = CSL_MIN_BLOCK_CAP;
+    if (max_by_bytes >= CSL_MIN_BLOCK_CAP && capped > max_by_bytes)
+        capped = max_by_bytes;
+    return capped;
 }
 
-cskiplist* csl_create(void) {
+int csl_choose_block_cap_for_level(int trie_level) {
+    int suggested;
+
+    if (trie_level <= 0) suggested = 2048;
+    else if (trie_level == 1) suggested = 1024;
+    else if (trie_level == 2) suggested = 512;
+    else if (trie_level <= 4) suggested = 256;
+    else if (trie_level <= 8) suggested = 128;
+    else if (trie_level <= 12) suggested = 64;
+    else suggested = 32;
+
+    return csl_tlb_aware_block_cap_hint(suggested);
+}
+
+cskiplist* csl_create_with_block_cap(int block_cap) {
     cskiplist* sl = (cskiplist*)calloc(1, sizeof(cskiplist));
+
     if (!sl) return NULL;
+    sl->block_cap = csl_tlb_aware_block_cap_hint(block_cap);
     sl->head = blk_alloc_head();
     if (!sl->head) { free(sl); return NULL; }
     sl->level = 0;
@@ -98,6 +139,18 @@ cskiplist* csl_create(void) {
     return sl;
 }
 
+cskiplist* csl_create_for_level(int trie_level) {
+    return csl_create_with_block_cap(csl_choose_block_cap_for_level(trie_level));
+}
+
+cskiplist* csl_create(void) {
+    return csl_create_with_block_cap(CSL_BLOCK_CAP);
+}
+
+int csl_get_block_cap(const cskiplist* sl) {
+    return sl ? sl->block_cap : 0;
+}
+
 void csl_free(cskiplist* sl, void (*free_val)(csl_val_t)) {
     if (!sl) return;
     csl_block* cur = sl->head;
@@ -106,6 +159,8 @@ void csl_free(cskiplist* sl, void (*free_val)(csl_val_t)) {
         if (cur != sl->head && free_val) {
             for (int i = 0; i < cur->count; ++i) free_val(cur->items[i].val);
         }
+        free(cur->items);
+        free(cur->next);
         free(cur);
         cur = nxt;
     }
@@ -264,11 +319,15 @@ static void eyt_build(const csl_kv* sorted, csl_kv* eyt, int n, int* si, int k) 
 
 /* Convert a block's items[] from sorted order to Eytzinger BFS order. */
 static void blk_sorted_to_eytzinger(csl_block* b) {
-    if (b->count <= 1) return;
-    csl_kv tmp[CSL_BLOCK_CAP];
-    memcpy(tmp, b->items, (size_t)b->count * sizeof(csl_kv));
+    csl_kv* tmp;
     int si = 0;
+
+    if (b->count <= 1) return;
+    tmp = (csl_kv*)malloc((size_t)b->count * sizeof(csl_kv));
+    if (!tmp) return;
+    memcpy(tmp, b->items, (size_t)b->count * sizeof(csl_kv));
     eyt_build(tmp, b->items, b->count, &si, 0);
+    free(tmp);
 }
 
 /* Recursive in-order traversal to extract sorted array from Eytzinger. */
@@ -281,17 +340,20 @@ static void eyt_extract(const csl_kv* eyt, csl_kv* sorted, int n, int* si, int k
 
 /* Convert a block's items[] from Eytzinger BFS order back to sorted order. */
 static void blk_eytzinger_to_sorted(csl_block* b) {
-    if (b->count <= 1) return;
-    csl_kv tmp[CSL_BLOCK_CAP];
+    csl_kv* tmp;
     int si = 0;
+
+    if (b->count <= 1) return;
+    tmp = (csl_kv*)malloc((size_t)b->count * sizeof(csl_kv));
+    if (!tmp) return;
     eyt_extract(b->items, tmp, b->count, &si, 0);
     memcpy(b->items, tmp, (size_t)b->count * sizeof(csl_kv));
+    free(tmp);
 }
 
 /* --- Eytzinger branchless search --- */
 
-/* Items per cache line: 64 bytes / sizeof(csl_kv). */
-#define EYT_ITEMS_PER_CL (64 / (int)sizeof(csl_kv))
+/* EYT_ITEMS_PER_CL is defined in the top-of-file constants section. */
 
 /*
  * Branchless search in Eytzinger-laid-out items[].
@@ -383,9 +445,9 @@ int csl_append(cskiplist* sl, csl_key_t key, csl_val_t val) {
     csl_block* tail = sl->head;
     while (tail->next[0]) tail = tail->next[0];
 
-    if (tail == sl->head || tail->count >= CSL_BLOCK_CAP) {
+    if (tail == sl->head || tail->count >= sl->block_cap) {
         /* allocate new data block */
-        csl_block* nb = blk_alloc();
+        csl_block* nb = blk_alloc(sl);
         if (!nb) return -1;
         nb->min_key = key;
         /* link at level 0 temporarily; others rebuilt later */
@@ -404,7 +466,7 @@ int csl_append(cskiplist* sl, csl_key_t key, csl_val_t val) {
     if (tail->count > 0 && key < tail->items[tail->count - 1].key) {
         /* out-of-order append not supported in fast path */
         /* fallback: insert in-order via binary search within block if space */
-        if (tail->count >= CSL_BLOCK_CAP) {
+        if (tail->count >= tail->item_cap) {
             if (was_eyt) blk_sorted_to_eytzinger(tail);
             return -1;
         }
@@ -461,11 +523,11 @@ csl_val_t csl_search(cskiplist* sl, csl_key_t key) {
     return NULL;
 }
 
-/* helper: split a full block into two roughly equal halves; assumes b->count == CSL_BLOCK_CAP */
+/* helper: split a full block into two roughly equal halves. */
 static csl_block* blk_split(cskiplist* sl, csl_block* b) {
     int right_cnt = b->count / 2;
     int left_cnt = b->count - right_cnt;
-    csl_block* nb = blk_alloc();
+    csl_block* nb = blk_alloc(sl);
     if (!nb) return NULL;
     /* move right half into nb */
     memcpy(nb->items, &b->items[left_cnt], right_cnt * sizeof(csl_kv));
@@ -495,7 +557,7 @@ int csl_insert(cskiplist* sl, csl_key_t key, csl_val_t val) {
     csl_block* b = (prev == sl->head) ? sl->head->next[0] : prev;
     if (!b || key < b->min_key) {
         /* need to insert into new block before b, or start a new first block */
-        csl_block* nb = blk_alloc();
+        csl_block* nb = blk_alloc(sl);
         if (!nb) return -1;
         nb->min_key = key;
         nb->next[0] = (prev == sl->head) ? sl->head->next[0] : prev->next[0];
@@ -519,7 +581,7 @@ int csl_insert(cskiplist* sl, csl_key_t key, csl_val_t val) {
         return 0;
     }
     pos = -pos - 1;
-    if (b->count < CSL_BLOCK_CAP) {
+    if (b->count < b->item_cap) {
         memmove(&b->items[pos+1], &b->items[pos], (b->count - pos) * sizeof(csl_kv));
         b->items[pos].key = key;
         b->items[pos].val = val;

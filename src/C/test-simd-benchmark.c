@@ -77,21 +77,32 @@ static cskiplist* build_skiplist(int N) {
     if (!sl) return NULL;
 
     /* Direct block construction: allocate and fill blocks manually */
-    int nblocks = (N + CSL_BLOCK_CAP - 1) / CSL_BLOCK_CAP;
+    int block_cap = csl_get_block_cap(sl);
+    int nblocks = (N + block_cap - 1) / block_cap;
     csl_block* prev_blk = sl->head;
     int key = 0;
 
     for (int bi = 0; bi < nblocks; bi++) {
-        int items_in_block = CSL_BLOCK_CAP;
-        if (bi == nblocks - 1 && N % CSL_BLOCK_CAP != 0) {
-            items_in_block = N % CSL_BLOCK_CAP;
+        int items_in_block = block_cap;
+        csl_block* b;
+        if (bi == nblocks - 1 && N % block_cap != 0) {
+            items_in_block = N % block_cap;
         }
 
         /* Allocate block with 1 skip pointer slot */
-        size_t blk_sz = sizeof(csl_block) + 1 * sizeof(csl_block*);
-        csl_block* b = (csl_block*)calloc(1, blk_sz);
+        b = (csl_block*)calloc(1, sizeof(csl_block));
         if (!b) { csl_free(sl, NULL); return NULL; }
+        b->item_cap = block_cap;
         b->skip_alloc = 1;
+        b->items = (csl_kv*)calloc((size_t)block_cap, sizeof(csl_kv));
+        b->next = (csl_block**)calloc(1, sizeof(csl_block*));
+        if (!b->items || !b->next) {
+            free(b->items);
+            free(b->next);
+            free(b);
+            csl_free(sl, NULL);
+            return NULL;
+        }
         b->min_key = key;
         b->count = items_in_block;
         b->prev = (prev_blk == sl->head) ? NULL : prev_blk;
