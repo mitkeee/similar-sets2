@@ -22,10 +22,10 @@ static int random_level(skiplist* sl) {
     return lvl;
 }
 
-static sl_node* sl_node_alloc(sl_key_t key, sl_val_t val) {
-    sl_node* n = (sl_node*)calloc(1, sizeof(sl_node));
+static sl_node* sl_node_alloc(sl_key_t key, sl_val_t val, int height) {
+    sl_node* n = (sl_node*)calloc(1, sizeof(sl_node) + (size_t)height * sizeof(sl_node*));
     if (!n) return NULL;
-    n->key = key; n->val = val;
+    n->key = key; n->val = val; n->height = height;
     return n;
 }
 
@@ -35,7 +35,7 @@ skiplist* sl_create(void) {
     sl->level = 0;
     sl->size = 0;
     sl->rng = 0x12345678; /* seed */
-    sl->head = sl_node_alloc(INT32_MIN, NULL);
+    sl->head = sl_node_alloc(INT32_MIN, NULL, SL_MAX_LEVEL);
     return sl;
 }
 
@@ -70,7 +70,7 @@ int sl_insert(skiplist* sl, sl_key_t key, sl_val_t val) {
         for (int i = sl->level + 1; i <= lvl; ++i) update[i] = sl->head;
         sl->level = lvl;
     }
-    sl_node* n = sl_node_alloc(key, val);
+    sl_node* n = sl_node_alloc(key, val, lvl + 1);
     if (!n) return -1;
     for (int i = 0; i <= lvl; ++i) {
         n->next[i] = update[i]->next[i];

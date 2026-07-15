@@ -27,12 +27,14 @@ extern "C" {
 typedef int sl_key_t;     /* monotonic order: ascending */
 typedef void* sl_val_t;   /* user payload */
 
-/* Node */
+/* Node: next[] is a flexible array sized to the node's tower height,
+ * so a node only pays for the levels it actually participates in
+ * (fair memory baseline against block-based variants). */
 typedef struct sl_node {
     sl_key_t key;
     sl_val_t val;
-    /* next pointers per level [0..height-1]; array sized to SL_MAX_LEVEL */
-    struct sl_node* next[SL_MAX_LEVEL];
+    int height;               /* number of allocated next[] levels */
+    struct sl_node* next[];   /* [0..height-1] */
 } sl_node;
 
 /* List */

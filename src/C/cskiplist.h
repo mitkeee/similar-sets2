@@ -46,10 +46,12 @@ typedef struct csl_block {
 /* Skip list of blocks */
 typedef struct cskiplist {
     csl_block* head;   /* sentinel block; min_key = INT32_MIN, count=0 */
+    csl_block* tail;   /* last data block, NULL when empty (O(1) appends) */
     int level;         /* top level currently valid (0-based) */
     int block_cap;     /* per-instance block capacity */
     size_t nblocks;    /* number of data blocks (excludes head) */
     size_t size;       /* number of items across all blocks */
+    uint32_t rng;      /* xorshift state for probabilistic block heights */
     /* simple stats */
     size_t stat_inserts;
     size_t stat_updates;
@@ -67,10 +69,15 @@ int csl_tlb_aware_block_cap_hint(int requested_block_cap);
 int csl_get_block_cap(const cskiplist* sl);
 void csl_free(cskiplist* sl, void (*free_val)(csl_val_t));
 
-/* Append item assuming non-decreasing keys. Returns 1 on append, 0 on update (same key at tail), -1 on OOM */
+/* Fast-path append for non-decreasing keys (bulk loading sorted data).
+ * Out-of-order keys fall back to csl_insert transparently.
+ * Returns 1 on append/insert, 0 on update of existing key, -1 on OOM */
 int csl_append(cskiplist* sl, csl_key_t key, csl_val_t val);
 
-/* General insert that maintains order. Splits blocks when full. Returns 1 on insert, 0 on update, -1 on OOM */
+/* General insert that maintains order AND the skip pointers (incremental
+ * maintenance: new blocks get probabilistic heights and are spliced into
+ * all their levels, so searches stay O(log n) without any rebuild).
+ * Splits blocks when full. Returns 1 on insert, 0 on update, -1 on OOM */
 int csl_insert(cskiplist* sl, csl_key_t key, csl_val_t val);
 
 /* Delete a key. Returns 1 when deleted, 0 if key not found. If provided, free_val is called on deleted value. */
@@ -79,7 +86,9 @@ int csl_delete(cskiplist* sl, csl_key_t key, void (*free_val)(csl_val_t));
 /* Find value for key; returns NULL if not found (note: NULL may be a stored value) */
 csl_val_t csl_search(cskiplist* sl, csl_key_t key);
 
-/* Rebuild skip pointers deterministically using power-of-two strides */
+/* Rebuild skip pointers deterministically using power-of-two strides.
+ * Optional: skips are already maintained incrementally by insert/delete.
+ * Calling this after a bulk load produces perfectly balanced skips. */
 void csl_rebuild_skips(cskiplist* sl);
 
 /* Enable/disable Eytzinger (BFS) layout within blocks.

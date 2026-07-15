@@ -20,6 +20,24 @@
 #include "connector.h"
 #include "set2.h"
 
+/* MinGW's msvcrt lacks clock_gettime(); shim it with QueryPerformanceCounter
+   so set2 builds on Windows too. */
+#if defined(_WIN32) && !defined(CLOCK_MONOTONIC)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#define CLOCK_MONOTONIC 0
+static int clock_gettime(int clk, struct timespec* ts)
+{
+   LARGE_INTEGER f, t;
+   (void)clk;
+   QueryPerformanceFrequency(&f);
+   QueryPerformanceCounter(&t);
+   ts->tv_sec  = (long)(t.QuadPart / f.QuadPart);
+   ts->tv_nsec = (long)((t.QuadPart % f.QuadPart) * 1000000000LL / f.QuadPart);
+   return 0;
+}
+#endif
+
 /*-------------------------- MAIN program ----------------------------------
  */
 

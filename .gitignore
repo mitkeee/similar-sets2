@@ -1,0 +1,30 @@
+# Build artifacts (issue #20)
+# Note: some .o/.exe files were committed historically; run
+#   git rm -r --cached src/C/*.o src/C/*.exe
+# once if you want them gone from the index too.
+*.o
+*.exe
+src/C/set2
+src/C/set2-csl
+src/C/hat
+src/C/skiptest
+src/C/cskiptest
+src/C/cskiptest-enh
+src/C/cskiptest-million
+src/C/skipbench
+src/C/askiptest
+src/C/cachebench
+src/C/simdbench
+src/C/eyttest
+src/C/branchless
+src/C/testproc
+src/C/testproc-base
+src/C/experiment
+src/C/conntest-base
+src/C/conntest-csl
+
+# IDE
+.idea/
+
+# Large generated experiment data stays out; the small summary CSVs in
+# src/C/results/ ARE meant to be committed (they are the thesis data).

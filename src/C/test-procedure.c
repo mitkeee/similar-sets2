@@ -127,7 +127,8 @@ static set2_node* load_dataset(const char *path, int *nsets, double *load_time_u
 
 /* ---------- Phase 2: Run queries ---------- */
 
-static void run_queries(FILE *f, set2_node *st, int hmg_dist) {
+static void run_queries(FILE *f, set2_node *st, int use_lcs,
+                        int hmg_dist, int skp_dist, int add_dist) {
 
     int el = -1;
     char *lin = (char *)malloc(MAX_STRING_SIZE);
@@ -161,10 +162,15 @@ static void run_queries(FILE *f, set2_node *st, int hmg_dist) {
         set_reset(sp);
         qesa_reset(q1);
         int hmg = hmg_dist;
+        int skp = skp_dist;
+        int add = add_dist;
 
-        /* timed similarity search */
+        /* timed similarity search (Hamming or LCS measure) */
         double t0 = timer_now_us();
-        set2_simsearch_hmg(st, s1, sp, &hmg, q1);
+        if (use_lcs)
+            set2_simsearch_lcs(st, s1, sp, &skp, &add, q1);
+        else
+            set2_simsearch_hmg(st, s1, sp, &hmg, q1);
         double t1 = timer_now_us();
 
         double elapsed_us = t1 - t0;
@@ -195,11 +201,13 @@ int main(int argc, char *argv[])
 {
     if (argc < 2) {
         fprintf(stderr,
-            "Usage: %s <datafile> [testfile] [hmg]\n"
+            "Usage: %s <datafile> [testfile] [N | hmg N | lcs SKP ADD]\n"
             "\n"
             "  datafile  - dataset (one set per line, space-separated ints)\n"
             "  testfile  - query file (same format); stdin if omitted\n"
-            "  hmg       - Hamming distance (default: 1)\n",
+            "  N         - Hamming distance (default: 1)\n"
+            "  hmg N     - explicit Hamming mode with distance N\n"
+            "  lcs S A   - LCS mode with skip distance S and add distance A\n",
             argv[0]);
         return 1;
     }
@@ -208,7 +216,19 @@ int main(int argc, char *argv[])
 
     const char *datafile = argv[1];
     const char *testfile = (argc >= 3) ? argv[2] : NULL;
-    int hmg_dist = (argc >= 4) ? atoi(argv[3]) : 1;
+    int use_lcs = 0;
+    int hmg_dist = 1, skp_dist = 1, add_dist = 1;
+    if (argc >= 4) {
+        if (strcmp(argv[3], "lcs") == 0) {
+            use_lcs = 1;
+            skp_dist = (argc >= 5) ? atoi(argv[4]) : 1;
+            add_dist = (argc >= 6) ? atoi(argv[5]) : 1;
+        } else if (strcmp(argv[3], "hmg") == 0) {
+            hmg_dist = (argc >= 5) ? atoi(argv[4]) : 1;
+        } else {
+            hmg_dist = atoi(argv[3]); /* legacy: bare number = hmg */
+        }
+    }
 
     /* configuration banner */
     print_config();
@@ -236,7 +256,9 @@ int main(int argc, char *argv[])
         qf = stdin;
     }
 
-    run_queries(qf, st, hmg_dist);
+    printf("[MODE]    %s hmg=%d skp=%d add=%d\n",
+           use_lcs ? "lcs" : "hmg", hmg_dist, skp_dist, add_dist);
+    run_queries(qf, st, use_lcs, hmg_dist, skp_dist, add_dist);
 
     if (testfile && qf)
         fclose(qf);

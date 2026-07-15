@@ -14,13 +14,28 @@ SIMD_BENCH_OBJS = cskiplist.o test-simd-benchmark.o
 EYT_TEST_OBJS = cskiplist.o test-eytzinger.o
 TEST_PROC_OBJS = config.o set.o qesa.o connector_csl.o cskiplist.o set2.o test-procedure.o
 TEST_PROC_BASE_OBJS = config.o set.o qesa.o connector.o set2.o test-procedure.o
-SLIBS = 
+EXPERIMENT_OBJS = cskiplist.o skiplist.o test-experiment.o
+OBJECTS1_CSL = config.o set.o qesa.o connector_csl.o cskiplist.o set2.o test-set2.o
+CONNTEST_BASE_OBJS = config.o connector.o test-connector.o
+CONNTEST_CSL_OBJS = config.o connector_csl.o cskiplist.o test-connector.o
+SLIBS =
 PROGRAM = set2
 
-all : set2 hat skiptest cskiptest cskiptest-enh cskiptest-million skipbench askiptest cachebench simdbench eyttest branchless testproc
+all : set2 set2-csl hat skiptest cskiptest cskiptest-enh cskiptest-million skipbench askiptest cachebench simdbench eyttest branchless testproc testproc-base experiment conntest-base conntest-csl
 
-set2 : 	$(OBJECTS1) 
+set2 : 	$(OBJECTS1)
 	$(LINK.c) -o $@ $(OBJECTS1) $(SLIBS)
+
+# set2 with the cskiplist-backed connector (issue #13: A/B build switch)
+set2-csl : $(OBJECTS1_CSL)
+	$(LINK.c) -o $@ $(OBJECTS1_CSL) $(SLIBS)
+
+# connector API conformance tests (issue #12): outputs must be identical
+conntest-base : $(CONNTEST_BASE_OBJS)
+	$(LINK.c) -o $@ $(CONNTEST_BASE_OBJS) $(SLIBS)
+
+conntest-csl : $(CONNTEST_CSL_OBJS)
+	$(LINK.c) -o $@ $(CONNTEST_CSL_OBJS) $(SLIBS)
 
 hat : 	$(OBJECTS2) 
 	$(LINK.c) -o $@ $(OBJECTS2) $(SLIBS)
@@ -35,10 +50,10 @@ cskiptest-enh : $(CSKIPLIST_ENH_OBJS)
 	$(LINK.c) -o $@ $(CSKIPLIST_ENH_OBJS) $(SLIBS)
 
 cskiptest-million : $(CSKIPLIST_MILLION_OBJS)
-	$(LINK.c) -o $@ $(CSKIPLIST_MILLION_OBJS) $(SLIBS)
+	$(LINK.c) -o $@ $(CSKIPLIST_MILLION_OBJS) $(SLIBS) -lpsapi
 
 skipbench : $(SKIPLIST_BENCH_OBJS)
-	$(LINK.c) -o $@ $(SKIPLIST_BENCH_OBJS) $(SLIBS)
+	$(LINK.c) -o $@ $(SKIPLIST_BENCH_OBJS) $(SLIBS) -lpsapi
 
 askiptest : $(ASKIPLIST_OBJS)
 	$(LINK.c) -o $@ $(ASKIPLIST_OBJS) $(SLIBS)
@@ -60,6 +75,14 @@ testproc : $(TEST_PROC_OBJS)
 
 testproc-base : $(TEST_PROC_BASE_OBJS)
 	$(LINK.c) -o $@ $(TEST_PROC_BASE_OBJS) $(SLIBS) -lpsapi
+
+experiment : $(EXPERIMENT_OBJS)
+	$(LINK.c) -o $@ $(EXPERIMENT_OBJS) $(SLIBS) -lpsapi
+
+clean :
+	rm -f *.o *.exe experiment set2 set2-csl hat skiptest cskiptest cskiptest-enh \
+	      cskiptest-million skipbench askiptest cachebench simdbench \
+	      eyttest branchless testproc testproc-base conntest-base conntest-csl
 
 config.o:	config.c
 
@@ -90,4 +113,6 @@ test-eytzinger.o: test-eytzinger.c cskiplist.h
 test-branchless.o: test-branchless.c
 connector_csl.o: connector_csl.c connector.h cskiplist.h
 test-procedure.o: test-procedure.c config.h set.h qesa.h connector.h set2.h cskiplist.h
+test-experiment.o: test-experiment.c cskiplist.h skiplist.h
+test-connector.o: test-connector.c config.h connector.h
 

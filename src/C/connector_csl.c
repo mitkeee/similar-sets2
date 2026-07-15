@@ -8,19 +8,28 @@
    The conn_impl pointer is stored in the seq field (cast to link*) since the sorted-array
    storage is not used in this adapter. */
 
+/*
+ * Returned link* lifetime: the original connector returns pointers into its
+ * internal array, so callers (set2.c) never free them and hold only a few at
+ * a time.  We mirror that contract with a small ring of scratch links per
+ * connector — a returned pointer stays valid for the next CON_SCRATCH-1
+ * link-returning calls.  No allocation happens per read (the old adapter
+ * malloc'd a link per call, leaking one per traversal step).
+ */
+#define CON_SCRATCH 8
+
 typedef struct conn_impl {
     cskiplist* sl;
-    csl_iter it;       /* iterator state for forward reads */
-    int cursor_global; /* global position (approx) for compatibility */
-    int last_global;   /* total items - 1 */
+    csl_iter it;                /* iterator state for forward reads */
+    link scratch[CON_SCRATCH];  /* ring of returned links */
+    unsigned scratch_ix;
 } conn_impl;
 
 /* Access the impl pointer stored in the seq field */
 #define IMPL(sp) ((conn_impl*)(sp)->seq)
 
-static link* make_link(int key, void* val) {
-    link* l = (link*)malloc(sizeof(link));
-    if (!l) return NULL;
+static link* make_link(conn_impl* im, int key, void* val) {
+    link* l = &im->scratch[im->scratch_ix++ % CON_SCRATCH];
     l->key = key; l->val = val; return l;
 }
 
@@ -31,7 +40,6 @@ connector* con_alloc() {
     if (!im) { free(c); return NULL; }
     im->sl = csl_create();
     if (!im->sl) { free(im); free(c); return NULL; }
-    im->cursor_global = -1; im->last_global = -1;
     c->length = 0; c->last = -1; c->cursor = -1;
     c->seq = (link*)im; /* store impl in seq field */
     return c;
@@ -52,31 +60,35 @@ int con_size(connector* sp) { return sp ? (int)IMPL(sp)->sl->size : 0; }
 void con_print_keys(connector* sp, FILE* f) {
     if (!sp) return; csl_iter it; if (!csl_iter_first(IMPL(sp)->sl, &it)) return; do { csl_kv* kv = csl_iter_get(&it); fprintf(f, "%d\n", kv->key); } while (csl_iter_next(&it)); }
 
-/* Lookup using search; updates cursor to index <= found key position */
+/* Lookup by key in O(log n). On an exact match the internal iterator is
+ * positioned at the found pair, so con_read continues right after it
+ * (mirrors the original's cursor semantics used by set2). */
 link* con_lookup(connector* sp, int key) {
-    if (!sp) return NULL; csl_iter it; int exact=0; if (!csl_iter_seek(IMPL(sp)->sl, key, &it, &exact)) { sp->cursor = IMPL(sp)->sl->size - 1; return NULL; }
-    /* compute global index by walking from beginning if needed */
-    int gidx = 0; csl_iter wit; if (csl_iter_first(IMPL(sp)->sl, &wit)) { do { if (wit.b == it.b && wit.idx == it.idx) break; gidx++; } while (csl_iter_next(&wit)); }
-    sp->cursor = gidx; sp->last = IMPL(sp)->sl->size - 1; IMPL(sp)->last_global = sp->last;
-    if (!exact) return NULL;
-    csl_kv* kv = csl_iter_get(&it); return kv ? make_link(kv->key, kv->val) : NULL;
+    if (!sp) return NULL;
+    conn_impl* im = IMPL(sp);
+    csl_iter it; int exact = 0;
+    sp->last = (int)im->sl->size - 1;
+    if (!csl_iter_seek(im->sl, key, &it, &exact) || !exact) return NULL;
+    im->it = it;
+    csl_kv* kv = csl_iter_get(&it);
+    return kv ? make_link(im, kv->key, kv->val) : NULL;
 }
 
 boolean con_member(connector* sp, int key) { return con_lookup(sp, key) != NULL; }
 
-boolean con_open(connector* sp) { if (!sp) return false; IMPL(sp)->it.b = IMPL(sp)->sl->head; IMPL(sp)->it.idx = 0; sp->cursor = -1; sp->last = IMPL(sp)->sl->size - 1; IMPL(sp)->last_global = sp->last; return true; }
+boolean con_open(connector* sp) { if (!sp) return false; IMPL(sp)->it.b = IMPL(sp)->sl->head; IMPL(sp)->it.idx = 0; IMPL(sp)->it.eytzinger = IMPL(sp)->sl->eytzinger; sp->cursor = -1; sp->last = IMPL(sp)->sl->size - 1; return true; }
 
 boolean con_open_at(connector* sp, int key) { if (!sp) return false; int exact=0; int found = csl_iter_seek(IMPL(sp)->sl, key, &IMPL(sp)->it, &exact); if (!found) { IMPL(sp)->it.b = NULL; IMPL(sp)->it.idx = -1; sp->cursor = -1; return 0; } if (!csl_iter_prev(IMPL(sp)->sl, &IMPL(sp)->it)) { IMPL(sp)->it.b = IMPL(sp)->sl->head; IMPL(sp)->it.idx = 0; } sp->cursor = -1; return exact; }
 
-link* con_peek(connector* sp) { if (!sp) return NULL; csl_iter it = IMPL(sp)->it; /* copy */ csl_iter_next(&it); csl_kv* kv = csl_iter_get(&it); return kv ? make_link(kv->key, kv->val) : NULL; }
+link* con_peek(connector* sp) { if (!sp) return NULL; csl_iter it = IMPL(sp)->it; /* copy */ csl_iter_next(&it); csl_kv* kv = csl_iter_get(&it); return kv ? make_link(IMPL(sp), kv->key, kv->val) : NULL; }
 
-link* con_read(connector* sp) { if (!sp) return NULL; if (!csl_iter_next(&IMPL(sp)->it)) return NULL; csl_kv* kv = csl_iter_get(&IMPL(sp)->it); if (!kv) return NULL; sp->cursor++; return make_link(kv->key, kv->val); }
+link* con_read(connector* sp) { if (!sp) return NULL; if (!csl_iter_next(&IMPL(sp)->it)) return NULL; csl_kv* kv = csl_iter_get(&IMPL(sp)->it); if (!kv) return NULL; sp->cursor++; return make_link(IMPL(sp), kv->key, kv->val); }
 
-link* con_current(connector* sp) { if (!sp) return NULL; csl_kv* kv = csl_iter_get(&IMPL(sp)->it); return kv ? make_link(kv->key, kv->val) : NULL; }
+link* con_current(connector* sp) { if (!sp) return NULL; csl_kv* kv = csl_iter_get(&IMPL(sp)->it); return kv ? make_link(IMPL(sp), kv->key, kv->val) : NULL; }
 
-link* con_peek_prev(connector* sp) { if (!sp) return NULL; csl_iter it = IMPL(sp)->it; if (!csl_iter_prev(IMPL(sp)->sl, &it)) return NULL; csl_kv* kv = csl_iter_get(&it); return kv ? make_link(kv->key, kv->val) : NULL; }
+link* con_peek_prev(connector* sp) { if (!sp) return NULL; csl_iter it = IMPL(sp)->it; if (!csl_iter_prev(IMPL(sp)->sl, &it)) return NULL; csl_kv* kv = csl_iter_get(&it); return kv ? make_link(IMPL(sp), kv->key, kv->val) : NULL; }
 
-link* con_read_prev(connector* sp) { if (!sp) return NULL; if (!csl_iter_prev(IMPL(sp)->sl, &IMPL(sp)->it)) return NULL; csl_kv* kv = csl_iter_get(&IMPL(sp)->it); if (!kv) return NULL; if (sp->cursor > 0) sp->cursor--; return make_link(kv->key, kv->val); }
+link* con_read_prev(connector* sp) { if (!sp) return NULL; if (!csl_iter_prev(IMPL(sp)->sl, &IMPL(sp)->it)) return NULL; csl_kv* kv = csl_iter_get(&IMPL(sp)->it); if (!kv) return NULL; if (sp->cursor > 0) sp->cursor--; return make_link(IMPL(sp), kv->key, kv->val); }
 
 boolean con_eos(connector* sp) { if (!sp) return true; csl_iter tmp = IMPL(sp)->it; return !csl_iter_next(&tmp); }
 

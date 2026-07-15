@@ -73,11 +73,6 @@ static csl_block* blk_alloc_with_cap(int item_cap, int skip_slots) {
     return b;
 }
 
-/* Allocate a data block with just 1 skip-pointer slot (level-0 link). */
-static csl_block* blk_alloc(const cskiplist* sl) {
-    return blk_alloc_with_cap(sl ? sl->block_cap : CSL_BLOCK_CAP, 1);
-}
-
 /* Allocate the head/sentinel block with full skip-pointer array. */
 static csl_block* blk_alloc_head(void) {
     return blk_alloc_with_cap(0, CSL_MAX_LEVEL);
@@ -126,12 +121,17 @@ cskiplist* csl_create_with_block_cap(int block_cap) {
     cskiplist* sl = (cskiplist*)calloc(1, sizeof(cskiplist));
 
     if (!sl) return NULL;
-    sl->block_cap = csl_tlb_aware_block_cap_hint(block_cap);
+    /* Honor the requested capacity exactly (block-size experiments depend
+     * on it); only reject nonsensical values.  Use the TLB-aware helper
+     * yourself if you want the clamped heuristic. */
+    sl->block_cap = (block_cap >= 2) ? block_cap : CSL_BLOCK_CAP;
     sl->head = blk_alloc_head();
     if (!sl->head) { free(sl); return NULL; }
+    sl->tail = NULL;
     sl->level = 0;
     sl->nblocks = 0;
     sl->size = 0;
+    sl->rng = 0x12345678u;
     sl->stat_inserts = 0;
     sl->stat_updates = 0;
     sl->stat_deletes = 0;
@@ -176,6 +176,83 @@ static csl_block* locate_block(cskiplist* sl, csl_key_t key) {
             x = x->next[lvl];
     }
     return x; /* x is the block whose min_key <= key, or head if before first */
+}
+
+/*-----------------------------------------------------------------------------
+ * Incremental skip maintenance.
+ *
+ * New blocks receive a probabilistic tower height (geometric, p = 1/2) and
+ * are spliced into every level of their tower at creation time, exactly like
+ * nodes in a classic skip list — except the "nodes" here are whole blocks.
+ * Deleting an emptied block unsplices it from all levels.  As a result the
+ * skip structure stays valid at all times and searches remain O(log n_blocks)
+ * without ever calling csl_rebuild_skips().  The rebuild is still available
+ * to produce perfectly balanced deterministic skips after a bulk load.
+ *----------------------------------------------------------------------------*/
+
+static uint32_t csl_rand(cskiplist* sl) {
+    uint32_t x = sl->rng;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    sl->rng = x ? x : 0x9E3779B9u;
+    return sl->rng;
+}
+
+/* Geometric tower height in [1, CSL_MAX_LEVEL]: each level with prob 1/2. */
+static int random_height(cskiplist* sl) {
+    uint32_t r = csl_rand(sl);
+    int h = 1;
+    while ((r & 1u) && h < CSL_MAX_LEVEL) { h++; r >>= 1; }
+    return h;
+}
+
+/* Fill update[] with the rightmost block at each level whose min_key is
+ * strictly below `key` (head acts as -infinity).  Levels above sl->level
+ * are left untouched — callers must pre-fill them if needed. */
+static void locate_preds(cskiplist* sl, csl_key_t key, csl_block** update) {
+    csl_block* x = sl->head;
+    for (int lvl = sl->level; lvl >= 0; --lvl) {
+        while (lvl < x->skip_alloc && x->next[lvl] &&
+               x->next[lvl]->min_key < key)
+            x = x->next[lvl];
+        update[lvl] = x;
+    }
+}
+
+/* Splice a freshly allocated, not-yet-linked block into levels
+ * [0, nb->skip_alloc).  nb->min_key must be set and unique among blocks.
+ * Maintains prev pointers, tail, nblocks and sl->level. */
+static void splice_block(cskiplist* sl, csl_block* nb) {
+    csl_block* update[CSL_MAX_LEVEL];
+    int h = nb->skip_alloc;
+
+    /* preds above the current top level are simply the head */
+    for (int lvl = sl->level + 1; lvl < h; ++lvl) update[lvl] = sl->head;
+    locate_preds(sl, nb->min_key, update);
+    if (h - 1 > sl->level) sl->level = h - 1;
+
+    for (int lvl = 0; lvl < h; ++lvl) {
+        nb->next[lvl] = update[lvl]->next[lvl];
+        update[lvl]->next[lvl] = nb;
+    }
+    nb->prev = (update[0] == sl->head) ? NULL : update[0];
+    if (nb->next[0]) nb->next[0]->prev = nb;
+    else sl->tail = nb;
+    sl->nblocks++;
+}
+
+/* Unsplice block b from every level it participates in and update
+ * bookkeeping.  Does NOT free b — caller owns it afterwards. */
+static void unsplice_block(cskiplist* sl, csl_block* b) {
+    csl_block* update[CSL_MAX_LEVEL];
+    locate_preds(sl, b->min_key, update);
+    for (int lvl = 0; lvl <= sl->level; ++lvl) {
+        if (lvl < update[lvl]->skip_alloc && update[lvl]->next[lvl] == b)
+            update[lvl]->next[lvl] = b->next[lvl];
+    }
+    if (b->next[0]) b->next[0]->prev = b->prev;
+    if (sl->tail == b) sl->tail = b->prev; /* NULL if b was the only block */
+    while (sl->level > 0 && !sl->head->next[sl->level]) sl->level--;
+    sl->nblocks--;
 }
 
 static int blk_binary_search(csl_block* b, csl_key_t key) {
@@ -237,11 +314,15 @@ static int blk_binary_search(csl_block* b, csl_key_t key) {
                 return i + lane;  /* exact match found */
             }
 
-            /* Early exit optimization for sorted arrays: if the smallest
-             * key in this group exceeds our search key, the key isn't here
-             * (all remaining keys are even larger, since the array is sorted). */
-            if (b->items[i].key > key) {
-                return -(i + 1);   /* insertion point before items[i] */
+            /* No exact match in this group. The lower bound is the FIRST
+             * lane whose key is greater than the search key — it may lie
+             * anywhere inside the group, not just at its start.
+             * _mm_cmpgt_epi32 is a signed compare, matching csl_key_t. */
+            __m128i vgt = _mm_cmpgt_epi32(vkeys, vkey);
+            int mask_gt = _mm_movemask_epi8(vgt);
+            if (mask_gt != 0) {
+                int lane = __builtin_ctz(mask_gt) >> 2;
+                return -(i + lane + 1);  /* insertion point inside/at group */
             }
         }
 
@@ -441,59 +522,49 @@ static int eyt_inorder_pred(int k, int n) {
 
 int csl_append(cskiplist* sl, csl_key_t key, csl_val_t val) {
     if (!sl) return -1;
-    /* Find tail block (last data block) */
-    csl_block* tail = sl->head;
-    while (tail->next[0]) tail = tail->next[0];
+    csl_block* tail = sl->tail;
 
-    if (tail == sl->head || tail->count >= sl->block_cap) {
-        /* allocate new data block */
-        csl_block* nb = blk_alloc(sl);
-        if (!nb) return -1;
-        nb->min_key = key;
-        /* link at level 0 temporarily; others rebuilt later */
-    tail->next[0] = nb;
-        nb->prev = (tail == sl->head ? NULL : tail);
-        sl->nblocks++;
-        tail = nb;
-    sl->level = 0; /* higher-level skips stale; force level-0 traversal until rebuild */
+    /* Lazy tail discovery: lists whose chains were built manually (tests,
+     * bulk loaders) may not have set sl->tail. */
+    if (!tail) {
+        csl_block* t = sl->head;
+        while (t->next[0]) t = t->next[0];
+        if (t != sl->head) sl->tail = tail = t;
     }
 
-    /* If Eytzinger, convert tail block to sorted for manipulation */
-    int was_eyt = sl->eytzinger && tail != sl->head && tail->count > 1;
-    if (was_eyt) blk_eytzinger_to_sorted(tail);
+    int was_eyt = 0;
+    if (tail) {
+        was_eyt = sl->eytzinger && tail->count > 1;
+        if (was_eyt) blk_eytzinger_to_sorted(tail);
 
-    /* enforce non-decreasing keys and sorted within block */
-    if (tail->count > 0 && key < tail->items[tail->count - 1].key) {
-        /* out-of-order append not supported in fast path */
-        /* fallback: insert in-order via binary search within block if space */
-        if (tail->count >= tail->item_cap) {
+        /* Update of the current maximum key — must be checked BEFORE the
+         * "block full" test, otherwise a duplicate lands in a new block. */
+        if (tail->count > 0 && tail->items[tail->count - 1].key == key) {
+            tail->items[tail->count - 1].val = val;
+            sl->stat_updates++;
             if (was_eyt) blk_sorted_to_eytzinger(tail);
-            return -1;
-        }
-        int pos = blk_binary_search(tail, key);
-        if (pos >= 0) {
-            tail->items[pos].val = val;
-            if (sl->eytzinger) blk_sorted_to_eytzinger(tail);
             return 0;
         }
-        pos = -pos - 1;
-        memmove(&tail->items[pos+1], &tail->items[pos], (tail->count - pos) * sizeof(csl_kv));
-        tail->items[pos].key = key;
-        tail->items[pos].val = val;
-        tail->count++;
-        if (key < tail->min_key) tail->min_key = key;
-        sl->size++;
-        if (sl->eytzinger) blk_sorted_to_eytzinger(tail);
-        return 1;
+
+        /* Out-of-order key: delegate to the general insert (handles
+         * ordering, splits and Eytzinger conversion uniformly). */
+        if (tail->count > 0 && key < tail->items[tail->count - 1].key) {
+            if (was_eyt) blk_sorted_to_eytzinger(tail);
+            return csl_insert(sl, key, val);
+        }
     }
 
-    /* fast append */
-    if (tail->count > 0 && tail->items[tail->count - 1].key == key) {
-        tail->items[tail->count - 1].val = val;
-        sl->stat_updates++;
-        if (was_eyt) blk_sorted_to_eytzinger(tail);
-        return 0;
+    if (!tail || tail->count >= tail->item_cap) {
+        if (tail && was_eyt) blk_sorted_to_eytzinger(tail);
+        csl_block* nb = blk_alloc_with_cap(sl->block_cap, random_height(sl));
+        if (!nb) return -1;
+        nb->min_key = key;
+        splice_block(sl, nb);
+        tail = nb;
+        was_eyt = 0;
     }
+
+    /* fast append at the end of the tail block */
     tail->items[tail->count].key = key;
     tail->items[tail->count].val = val;
     tail->count++;
@@ -523,50 +594,46 @@ csl_val_t csl_search(cskiplist* sl, csl_key_t key) {
     return NULL;
 }
 
-/* helper: split a full block into two roughly equal halves. */
+/* helper: split a full block into two roughly equal halves.
+ * The new right block gets a probabilistic tower height and is spliced
+ * into all its levels, keeping the skip structure valid (no rebuild). */
 static csl_block* blk_split(cskiplist* sl, csl_block* b) {
     int right_cnt = b->count / 2;
     int left_cnt = b->count - right_cnt;
-    csl_block* nb = blk_alloc(sl);
+    csl_block* nb = blk_alloc_with_cap(sl->block_cap, random_height(sl));
     if (!nb) return NULL;
     /* move right half into nb */
     memcpy(nb->items, &b->items[left_cnt], right_cnt * sizeof(csl_kv));
     nb->count = right_cnt;
     nb->min_key = nb->items[0].key;
-    /* fix left block count */
+    /* fix left block count (its min_key is unchanged) */
     b->count = left_cnt;
-    b->min_key = (left_cnt > 0) ? b->items[0].key : INT_MIN;
-    /* splice nb after b at level 0 */
-    nb->next[0] = b->next[0];
-    b->next[0] = nb;
-    nb->prev = b;
-    if (nb->next[0]) nb->next[0]->prev = nb;
-    sl->nblocks++;
+    b->min_key = b->items[0].key;
     sl->stat_splits++;
-    sl->level = 0;
+    splice_block(sl, nb); /* links all levels, prev, tail, nblocks */
     return nb;
 }
 
 int csl_insert(cskiplist* sl, csl_key_t key, csl_val_t val) {
     if (!sl) return -1;
-    /* find candidate block by linear scan on level 0 to avoid stale skips */
-    csl_block* prev = sl->head;
-    csl_block* cur = sl->head->next[0];
-    while (cur && cur->min_key <= key) { prev = cur; cur = cur->next[0]; }
-    /* candidate is prev (may be head) */
-    csl_block* b = (prev == sl->head) ? sl->head->next[0] : prev;
-    if (!b || key < b->min_key) {
-        /* need to insert into new block before b, or start a new first block */
-        csl_block* nb = blk_alloc(sl);
+
+    /* Skip pointers are maintained incrementally, so the skip traversal is
+     * always valid: O(log n_blocks) instead of a level-0 linear scan. */
+    csl_block* b = locate_block(sl, key);
+    if (b == sl->head) b = sl->head->next[0]; /* key precedes first block */
+
+    if (!b) {
+        /* empty list: create the first data block */
+        csl_block* nb = blk_alloc_with_cap(sl->block_cap, random_height(sl));
         if (!nb) return -1;
         nb->min_key = key;
-        nb->next[0] = (prev == sl->head) ? sl->head->next[0] : prev->next[0];
-        if (prev == sl->head) sl->head->next[0] = nb; else prev->next[0] = nb;
-        nb->prev = (prev == sl->head ? NULL : prev);
-        if (nb->next[0]) nb->next[0]->prev = nb;
-        sl->nblocks++;
-        b = nb;
-        sl->level = 0;
+        nb->items[0].key = key;
+        nb->items[0].val = val;
+        nb->count = 1;
+        splice_block(sl, nb);
+        sl->size++;
+        sl->stat_inserts++;
+        return 1;
     }
 
     /* If Eytzinger layout is active, convert block to sorted for manipulation */
@@ -581,67 +648,37 @@ int csl_insert(cskiplist* sl, csl_key_t key, csl_val_t val) {
         return 0;
     }
     pos = -pos - 1;
-    if (b->count < b->item_cap) {
-        memmove(&b->items[pos+1], &b->items[pos], (b->count - pos) * sizeof(csl_kv));
-        b->items[pos].key = key;
-        b->items[pos].val = val;
-        b->count++;
-        if (pos == 0) b->min_key = key;
-        sl->size++;
-        sl->stat_inserts++;
-        if (sl->eytzinger) blk_sorted_to_eytzinger(b);
-        return 1;
+
+    csl_block* right = NULL;
+    csl_block* target = b;
+    if (b->count >= b->item_cap) {
+        /* full: split, then insert into whichever half owns the key */
+        right = blk_split(sl, b);
+        if (!right) { if (was_eyt) blk_sorted_to_eytzinger(b); return -1; }
+        if (key >= right->min_key) target = right;
+        pos = blk_binary_search(target, key);
+        pos = -pos - 1; /* key is known absent */
     }
 
-    /* split and decide which block to insert into */
-    csl_block* right = blk_split(sl, b);
-    if (!right) { if (sl->eytzinger) blk_sorted_to_eytzinger(b); return -1; }
-    csl_block* target;
-    if (key >= right->min_key) {
-        target = right;
-        pos = blk_binary_search(target, key);
-        if (pos >= 0) {
-            target->items[pos].val = val; sl->stat_updates++;
-            if (sl->eytzinger) { blk_sorted_to_eytzinger(b); blk_sorted_to_eytzinger(right); }
-            return 0;
-        }
-        pos = -pos - 1;
-        memmove(&target->items[pos+1], &target->items[pos], (target->count - pos) * sizeof(csl_kv));
-        target->items[pos].key = key;
-        target->items[pos].val = val;
-        target->count++;
-        if (pos == 0) target->min_key = key;
-    } else {
-        target = b;
-        pos = blk_binary_search(target, key);
-        if (pos >= 0) {
-            target->items[pos].val = val; sl->stat_updates++;
-            if (sl->eytzinger) { blk_sorted_to_eytzinger(b); blk_sorted_to_eytzinger(right); }
-            return 0;
-        }
-        pos = -pos - 1;
-        memmove(&target->items[pos+1], &target->items[pos], (target->count - pos) * sizeof(csl_kv));
-        target->items[pos].key = key;
-        target->items[pos].val = val;
-        target->count++;
-        if (pos == 0) target->min_key = key;
-    }
+    memmove(&target->items[pos+1], &target->items[pos],
+            (target->count - pos) * sizeof(csl_kv));
+    target->items[pos].key = key;
+    target->items[pos].val = val;
+    target->count++;
+    if (pos == 0) target->min_key = key;
     sl->size++;
     sl->stat_inserts++;
-    if (sl->eytzinger) { blk_sorted_to_eytzinger(b); blk_sorted_to_eytzinger(right); }
+    if (sl->eytzinger) {
+        blk_sorted_to_eytzinger(b);
+        if (right) blk_sorted_to_eytzinger(right);
+    }
     return 1;
 }
 
 int csl_delete(cskiplist* sl, csl_key_t key, void (*free_val)(csl_val_t)) {
     if (!sl) return 0;
-    /* linear search across level 0 */
-    csl_block* prev = sl->head;
-    csl_block* b = sl->head->next[0];
-    while (b && b->min_key <= key) {
-        if (b->next[0] && key >= b->next[0]->min_key) { prev = b; b = b->next[0]; continue; }
-        break;
-    }
-    if (!b) return 0;
+    csl_block* b = locate_block(sl, key);
+    if (b == sl->head) return 0; /* key precedes the first block: not present */
 
     /* If Eytzinger, convert to sorted for manipulation */
     int was_eyt = sl->eytzinger && b->count > 1;
@@ -658,12 +695,11 @@ int csl_delete(cskiplist* sl, csl_key_t key, void (*free_val)(csl_val_t)) {
     sl->size--;
     sl->stat_deletes++;
     if (b->count == 0) {
-        /* remove empty block */
-        if (prev) prev->next[0] = b->next[0];
-        if (b->next[0]) b->next[0]->prev = (prev == sl->head ? NULL : prev);
+        /* remove the emptied block from all skip levels, then free it */
+        unsplice_block(sl, b);
+        free(b->items);
+        free(b->next);
         free(b);
-        sl->nblocks--;
-        sl->level = 0;
     } else {
         if (idx == 0) b->min_key = b->items[0].key;
         if (sl->eytzinger) blk_sorted_to_eytzinger(b);
@@ -685,10 +721,8 @@ int csl_iter_seek(cskiplist* sl, csl_key_t key, csl_iter* it, int* exact) {
     if (exact) *exact = 0;
     if (!sl || !it) return 0;
     it->eytzinger = sl->eytzinger;
-    csl_block* b = sl->head->next[0];
-    csl_block* last = NULL;
-    while (b && b->min_key <= key) { last = b; b = b->next[0]; }
-    csl_block* cand = last ? last : sl->head->next[0];
+    csl_block* cand = locate_block(sl, key);
+    if (cand == sl->head) cand = sl->head->next[0];
     if (!cand) { it->b = NULL; it->idx = -1; return 0; }
     int idx = sl->eytzinger ? blk_eytzinger_search(cand, key)
                             : blk_binary_search(cand, key);
@@ -758,37 +792,40 @@ void csl_rebuild_skips(cskiplist* sl) {
     /* determine levels: highest k such that 2^k <= m */
     int top = 0;
     while ((size_t)(1ull << (top+1)) <= m) ++top;
+    if (top >= CSL_MAX_LEVEL) top = CSL_MAX_LEVEL - 1;
     sl->level = top;
 
     /*
      * Grow blocks that need higher skip levels.  A block at index i
      * participates in level k iff (i+1) is divisible by 2^k.  Its
      * required height = number-of-trailing-zeros(i+1) + 1, capped at
-     * top+1.  After realloc we rebuild the entire level-0 chain and
-     * prev pointers from arr[] so moved-block addresses are handled.
+     * top+1.  (blk_ensure_skips reallocates only the next[] array;
+     * the block itself never moves, so inbound pointers stay valid.)
      */
     for (size_t i = 0; i < m; ++i) {
         int height = 1;
         { size_t v = i + 1; while ((v & 1) == 0 && height <= top) { v >>= 1; ++height; } }
         if (height > top + 1) height = top + 1;
-        if (arr[i]->skip_alloc < height) {
-            csl_block* nb = blk_ensure_skips(arr[i], height);
-            if (nb) arr[i] = nb; /* may have moved */
-        }
+        if (arr[i]->skip_alloc < height)
+            blk_ensure_skips(arr[i], height);
     }
 
-    /* Rebuild level-0 chain and prev pointers from the (possibly moved) arr[] */
+    /* Rebuild level-0 chain and prev pointers */
     sl->head->next[0] = (m > 0) ? arr[0] : NULL;
     for (size_t i = 0; i < m; ++i) {
         arr[i]->next[0] = (i + 1 < m) ? arr[i + 1] : NULL;
         arr[i]->prev = (i > 0) ? arr[i - 1] : NULL;
     }
+    sl->tail = (m > 0) ? arr[m - 1] : NULL;
 
-    /* clear skip pointers above level 0 */
+    /* clear skip pointers above level 0 (including head levels above top,
+     * which would otherwise go stale when the level count shrinks) */
     for (size_t i = 0; i < m; ++i) {
         for (int lvl = 1; lvl < arr[i]->skip_alloc; ++lvl)
             arr[i]->next[lvl] = NULL;
     }
+    for (int lvl = top + 1; lvl < CSL_MAX_LEVEL; ++lvl)
+        sl->head->next[lvl] = NULL;
 
     /* rebuild higher levels deterministically */
     for (int lvl = 1; lvl <= top; ++lvl) {
